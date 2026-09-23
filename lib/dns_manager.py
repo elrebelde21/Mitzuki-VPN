@@ -10,8 +10,8 @@ class DNSManager:
     def verify_dns_records(self, domain: str, ip: str, tunnel_domain: str = None) -> Dict[str, bool]:
         """
         Verifica los registros A y NS
-        domain = ds.mitzuki.xyz (servidor)
-        tunnel_domain = d.mitzuki.xyz (túnel)
+        domain = ds.tudominio.com (servidor)
+        tunnel_domain = d.tudominio.com (túnel)
         """
         result = {
             'a_record': False,
