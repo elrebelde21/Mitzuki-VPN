@@ -1,0 +1,13 @@
+.npm/
+.git/
+__pycache__/
+.cache/
+.config/
+.local/
+.speedtest-bin/
+.env
+package-lock.json
+vaydns.db
+yarn.lock 
+node_modules/
+tmp/
