@@ -13,22 +13,25 @@ DB_PATH = os.getenv('DB_PATH', 'vaydns.db')
 # ============================================
 # CONFIGURACIÓN DEL SERVIDOR
 # ============================================
+
 DEFAULT_SERVER = {
     'name': 'Servidor Principal',
-    'ip': '89.777777',
-    'ssh_port': 22,
-    'username': 'root',
-    'password': 'TU_CONTRASEÑA_AQUI',
-    'domain': 'TU_DNS_TIPO_A_AQUI',
-    'tunnel_domain': 'TU_DNS_TIPO_NS_AQUI',
-    'record_type': 'txt',
-    'dnstt_compat': True,
-    'clientid_size': 8,
-    'port': 53
+    'ip': process.env.DEFAULT_SERVER_IP,
+    'ssh_port': process.env.DEFAULT_SERVER_SSH_PORT,
+    'username': process.env.DEFAULT_SERVER_USERNAME,
+    'password': process.env.DEFAULT_SERVER_PASSWORD,
+    'domain': process.env.DEFAULT_SERVER_DOMAIN,
+    'tunnel_domain': process.env.DEFAULT_SERVER_TUNNEL_DOMAIN,
+    'record_type': process.env.DEFAULT_SERVER_RECORD_TYPE,
+    'dnstt_compat': process.env.DEFAULT_SERVER_DNSTT,
+    'clientid_size': process.env.DEFAULT_SERVER_CLIENT
+    'port': process.env.DEFAULT_SERVER_PORT
 }
 
 # Configuración de VayDNS
 VAYDNS_BINARY_URL = 'https://raw.githubusercontent.com/phoenixdnsvpn/phoenix-vpn/main/scripts/vaydns-server'
+APP_DOWNLOAD_URL = 'https://tu-link-de-descarga.com'
+WG_APP_DOWNLOAD_URL = 'https://play.google.com/store/apps/details?id=com.wireguard.android'
 
 # ============================================
 # MODO PÚBLICO / PRIVADO

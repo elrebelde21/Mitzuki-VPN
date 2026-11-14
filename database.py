@@ -1,6 +1,6 @@
 import config
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 
@@ -72,6 +72,32 @@ class Database:
             )
         ''')
 
+        # Tabla de revendedores / planes premium (por telegram_id)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS resellers (
+                telegram_id INTEGER PRIMARY KEY,
+                max_accounts INTEGER DEFAULT 1,
+                max_conn INTEGER DEFAULT 3,
+                max_days INTEGER DEFAULT 30,
+                expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # --- Migraciones: columnas nuevas en users (cuentas SSH / WireGuard) ---
+        for ddl in (
+            "ALTER TABLE users ADD COLUMN password TEXT",
+            "ALTER TABLE users ADD COLUMN max_conn INTEGER DEFAULT 3",
+            "ALTER TABLE users ADD COLUMN conn_type TEXT DEFAULT 'vaydns'",
+            "ALTER TABLE users ADD COLUMN wg_ip TEXT",
+            "ALTER TABLE users ADD COLUMN wg_pubkey TEXT",
+            "ALTER TABLE users ADD COLUMN wg_privkey TEXT",
+        ):
+            try:
+                cursor.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # la columna ya existe
+
         conn.commit()
         conn.close()
 
@@ -122,25 +148,27 @@ class Database:
 
     # --- Cuentas ---
     def add_user(self, telegram_id: int, username: str, server_id: int,
-                 vaydns_url: str, expires_at: str) -> int:
+                 vaydns_url: str, expires_at: str,
+                 password: str = None, max_conn: int = 3) -> int:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO users (telegram_id, username, server_id, vaydns_url, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (telegram_id, username, server_id, vaydns_url, expires_at))
+            INSERT INTO users (telegram_id, username, server_id, vaydns_url, expires_at, password, max_conn)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (telegram_id, username, server_id, vaydns_url, expires_at, password, max_conn))
         user_id = cursor.lastrowid
         conn.commit()
         conn.close()
         return user_id
 
-    def add_user_admin(self, name: str, server_id: int, vaydns_url: str, expires_at: str) -> int:
+    def add_user_admin(self, name: str, server_id: int, vaydns_url: str, expires_at: str,
+                       password: str = None, max_conn: int = 3) -> int:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO users (telegram_id, username, server_id, vaydns_url, expires_at)
-            VALUES (0, ?, ?, ?, ?)
-        ''', (name, server_id, vaydns_url, expires_at))
+            INSERT INTO users (telegram_id, username, server_id, vaydns_url, expires_at, password, max_conn)
+            VALUES (0, ?, ?, ?, ?, ?, ?)
+        ''', (name, server_id, vaydns_url, expires_at, password, max_conn))
         user_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -167,6 +195,58 @@ class Database:
         conn.close()
         return dict(row) if row else None
 
+    def get_user_by_name(self, username: str) -> Optional[Dict[str, Any]]:
+        """Busca una cuenta activa por su nombre de usuario (el de la cuenta SSH)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE username = ? AND is_active = 1', (username,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_user_accounts(self, telegram_id: int) -> List[Dict[str, Any]]:
+        """Todas las cuentas activas de un usuario de Telegram (SSH + WireGuard)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.*, s.name as server_name, s.domain, s.ip
+            FROM users u
+            JOIN servers s ON u.server_id = s.id
+            WHERE u.telegram_id = ? AND u.is_active = 1
+            ORDER BY u.created_at DESC
+        ''', (telegram_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    # --- WireGuard ---
+    def add_wg_user(self, telegram_id: int, username: str, server_id: int,
+                    expires_at: str, wg_ip: str, wg_pubkey: str, wg_privkey: str,
+                    max_conn: int = 1) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO users (telegram_id, username, server_id, vaydns_url, expires_at,
+                               max_conn, conn_type, wg_ip, wg_pubkey, wg_privkey)
+            VALUES (?, ?, ?, '', ?, ?, 'wireguard', ?, ?, ?)
+        ''', (telegram_id, username, server_id, expires_at, max_conn, wg_ip, wg_pubkey, wg_privkey))
+        user_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return user_id
+
+    def get_wg_users(self, server_id: int) -> List[Dict[str, Any]]:
+        """Peers WireGuard activos de un servidor (para reconstruir wg0.conf)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM users
+            WHERE is_active = 1 AND conn_type = 'wireguard' AND server_id = ?
+        ''', (server_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
     def get_all_users(self) -> List[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -180,6 +260,30 @@ class Database:
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+    def get_expired_users(self) -> List[Dict[str, Any]]:
+        """Cuentas activas cuyo vencimiento ya pasó (para borrarlas del servidor)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute('''
+            SELECT * FROM users
+            WHERE is_active = 1 AND expires_at IS NOT NULL AND expires_at < ?
+        ''', (now,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def extend_user_expiry(self, user_id: int, days: int) -> Optional[str]:
+        """Renueva el vencimiento a hoy + days y devuelve la nueva fecha ISO."""
+        new_expiry = (datetime.now() + timedelta(days=days)).isoformat()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET expires_at = ?, is_active = 1 WHERE id = ?',
+                       (new_expiry, user_id))
+        conn.commit()
+        conn.close()
+        return new_expiry
 
     def deactivate_user(self, telegram_id: int):
         conn = self.get_connection()
@@ -265,31 +369,96 @@ class Database:
     def set_public_mode(self, enabled: bool):
         self.set_config('public_mode', '1' if enabled else '0')
 
-    # --- Premium ---
-    def set_premium(self, telegram_id: int, enabled: bool):
+    # --- Record type (TXT/CAA) persistido ---
+    def get_record_type(self) -> str:
+        """TXT/CAA activo. Default seguro = txt (lo que funciona con compat)."""
+        value = self.get_config('record_type')
+        if value in ('txt', 'caa'):
+            return value
+        return 'txt'
+
+    def set_record_type(self, record_type: str):
+        self.set_config('record_type', record_type)
+
+    # --- Backend de autenticación: ssh o socks ---
+    def get_backend(self) -> str:
+        value = self.get_config('backend')
+        return value if value in ('ssh', 'socks') else 'ssh'
+
+    def set_backend(self, backend: str):
+        self.set_config('backend', backend)
+
+    # --- Premium / Revendedores (planes) ---
+    def set_reseller(self, telegram_id: int, max_accounts: int, max_conn: int,
+                     max_days: int, premium_days: int):
+        """Crea/actualiza el plan premium de un usuario. Vence en hoy + premium_days."""
+        expires_at = (datetime.now() + timedelta(days=premium_days)).isoformat()
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('UPDATE users SET is_premium = ? WHERE telegram_id = ?',
-                       (1 if enabled else 0, telegram_id))
+        cursor.execute('''
+            INSERT INTO resellers (telegram_id, max_accounts, max_conn, max_days, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                max_accounts = excluded.max_accounts,
+                max_conn = excluded.max_conn,
+                max_days = excluded.max_days,
+                expires_at = excluded.expires_at
+        ''', (telegram_id, max_accounts, max_conn, max_days, expires_at))
         conn.commit()
         conn.close()
 
-    def is_premium(self, telegram_id: int) -> bool:
+    def get_reseller(self, telegram_id: int) -> Optional[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT is_premium FROM users WHERE telegram_id = ? AND is_active = 1',
-                       (telegram_id,))
+        cursor.execute('SELECT * FROM resellers WHERE telegram_id = ?', (telegram_id,))
         row = cursor.fetchone()
         conn.close()
-        return bool(row[0]) if row else False
+        return dict(row) if row else None
+
+    def is_reseller_active(self, telegram_id: int) -> bool:
+        r = self.get_reseller(telegram_id)
+        if not r or not r.get('expires_at'):
+            return False
+        try:
+            return datetime.fromisoformat(r['expires_at']) > datetime.now()
+        except (ValueError, TypeError):
+            return False
+
+    def remove_reseller(self, telegram_id: int):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM resellers WHERE telegram_id = ?', (telegram_id,))
+        conn.commit()
+        conn.close()
+
+    def count_user_accounts(self, telegram_id: int) -> int:
+        """Cuántas cuentas SSH activas creó este usuario."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users WHERE telegram_id = ? AND is_active = 1',
+                       (telegram_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
+    # Compat: "premium" ahora significa "tiene plan de revendedor activo"
+    def is_premium(self, telegram_id: int) -> bool:
+        return self.is_reseller_active(telegram_id)
+
+    def set_premium(self, telegram_id: int, enabled: bool):
+        """Compat: activar = plan básico 30d; desactivar = quitar plan."""
+        if enabled:
+            self.set_reseller(telegram_id, max_accounts=1, max_conn=3, max_days=30, premium_days=30)
+        else:
+            self.remove_reseller(telegram_id)
 
     def update_server_credentials(self, server_id: int, username: str, password: str):
         """Actualiza usuario y contraseña de un servidor"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            UPDATE servers 
-            SET username = ?, password = ?, updated_at = CURRENT_TIMESTAMP 
+            UPDATE servers
+            SET username = ?, password = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         ''', (username, password, server_id))
         conn.commit()
