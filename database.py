@@ -4,6 +4,11 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 
+
+# Record types soportados por vaydns-server (-record-type).
+# Solo TXT usa -dnstt-compat (DNSTT clásico solo habla TXT).
+RECORD_TYPES = ('txt', 'caa', 'null', 'cname', 'a', 'aaaa', 'mx', 'ns', 'srv')
+
 class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -369,11 +374,11 @@ class Database:
     def set_public_mode(self, enabled: bool):
         self.set_config('public_mode', '1' if enabled else '0')
 
-    # --- Record type (TXT/CAA) persistido ---
+    # --- Record type persistido (todos los que soporta VayDNS) ---
     def get_record_type(self) -> str:
-        """TXT/CAA activo. Default seguro = txt (lo que funciona con compat)."""
-        value = self.get_config('record_type')
-        if value in ('txt', 'caa'):
+        """Record type activo. Default seguro = txt (lo que funciona con compat)."""
+        value = (self.get_config('record_type') or '').lower()
+        if value in RECORD_TYPES:
             return value
         return 'txt'
 

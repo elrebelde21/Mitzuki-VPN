@@ -1,6 +1,6 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import config
-from database import Database
+from database import Database, RECORD_TYPES
 
 db = Database(config.DB_PATH)
 
@@ -65,14 +65,20 @@ def get_settings_menu() -> InlineKeyboardMarkup:
 
 
 def get_record_menu() -> InlineKeyboardMarkup:
-    """Toggle TXT/CAA del servidor (admin)."""
-    current = db.get_record_type().upper()
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Actual: {current}", callback_data='noop')],
-        [InlineKeyboardButton("📄 Usar TXT", callback_data='admin_set_txt'),
-         InlineKeyboardButton("🔤 Usar CAA", callback_data='admin_set_caa')],
-        [InlineKeyboardButton("◀️ Volver", callback_data='admin_panel')],
-    ])
+    """Selector de record type del servidor (admin): todos los que soporta VayDNS."""
+    current = db.get_record_type()
+    keyboard = [[InlineKeyboardButton(f"Actual: {current.upper()}", callback_data='noop')]]
+    row = []
+    for rt in RECORD_TYPES:
+        label = f"✅ {rt.upper()}" if rt == current else rt.upper()
+        row.append(InlineKeyboardButton(label, callback_data=f'admin_set_rt_{rt}'))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("◀️ Volver", callback_data='admin_panel')])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def get_backend_menu() -> InlineKeyboardMarkup:

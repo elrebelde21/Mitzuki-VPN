@@ -370,7 +370,7 @@ async def create_ssh_devices(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.clear()
         return ConversationHandler.END
 
-    # El tipo (TXT/CAA) lo define el servidor, no la cuenta
+    # El record type lo define el servidor, no la cuenta
     cfg = ssh_accounts.client_config(server, user, password)
     expires_at = (datetime.now() + timedelta(days=days)).isoformat()
 

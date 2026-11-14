@@ -4,7 +4,7 @@ from telegram.ext import ConversationHandler, ContextTypes, MessageHandler, filt
 from lib.masterdnsvpn_manager import MasterDnsVPNManager
 
 import config
-from database import Database
+from database import Database, RECORD_TYPES
 from lib.helpers import is_admin, escape_html
 from lib.vaydns_manager import VayDNSManager
 from lib.slipstream_manager import SlipstreamManager
@@ -88,10 +88,10 @@ async def button_handler_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         await show_traffic(query)
     elif data == 'admin_record_menu':
         await show_record_menu(query)
-    elif data == 'admin_set_txt':
-        await set_record(query, 'txt')
-    elif data == 'admin_set_caa':
-        await set_record(query, 'caa')
+    elif data.startswith('admin_set_rt_'):
+        await set_record(query, data[len('admin_set_rt_'):])
+    elif data in ('admin_set_txt', 'admin_set_caa'):  # botones viejos
+        await set_record(query, data[len('admin_set_'):])
     elif data == 'admin_backend_menu':
         await show_backend_menu(query)
     elif data == 'admin_set_ssh':
@@ -270,7 +270,7 @@ async def show_traffic(query):
     await query.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
 
 # ==========================================
-# RECORD TYPE TXT/CAA
+# RECORD TYPE (todos los soportados por VayDNS)
 # ==========================================
 async def show_record_menu(query):
     current = db.get_record_type().upper()
@@ -280,13 +280,21 @@ async def show_record_menu(query):
 📋 <b>Actual:</b> {current}
 
 • <b>TXT</b> → más estable y rápido (con DNSTT compat). Recomendado.
-• <b>CAA</b> → evasión, para redes que bloquean TXT (sin compat).
+• <b>CAA</b> / <b>NULL</b> → evasión, para redes que bloquean TXT.
+• <b>CNAME</b> / <b>MX</b> / <b>NS</b> / <b>SRV</b> → alternativas cuando otros tipos están filtrados.
+• <b>A</b> / <b>AAAA</b> → muy comunes (difíciles de bloquear) pero más lentos.
 
+ℹ️ Solo TXT usa DNSTT compat; el resto va sin compat.
 ⚠️ Al cambiarlo se reinicia VayDNS y <b>todos los clientes</b> deben usar ese tipo.
 """
     await query.edit_message_text(text, parse_mode='HTML', reply_markup=get_record_menu())
 
 async def set_record(query, record_type):
+    record_type = (record_type or '').lower()
+    if record_type not in RECORD_TYPES:
+        await query.edit_message_text("❌ Record type inválido.", reply_markup=get_record_menu())
+        return
+
     servers = db.get_all_servers()
     if not servers:
         await query.edit_message_text("❌ No hay servidor.", reply_markup=get_admin_menu())

@@ -22,6 +22,7 @@ import paramiko
 import config
 import os
 from typing import Dict, Optional, Tuple
+from database import RECORD_TYPES
 
 
 # Puerto interno del sshd dedicado a túnel (solo 127.0.0.1)
@@ -370,7 +371,7 @@ WantedBy=multi-user.target"""
     # ------------------------------------------------------------------
     def effective_record_type(self) -> Tuple[str, bool]:
         rt = (self.db.get_record_type() or 'txt').lower()
-        if rt not in ('txt', 'caa'):
+        if rt not in RECORD_TYPES:
             rt = 'txt'
         dnstt_compat = (rt == 'txt')
         return rt, dnstt_compat
@@ -384,7 +385,7 @@ WantedBy=multi-user.target"""
         pubkey = server.get('pubkey') or ''
         clientid_size = d.get('clientid_size', 8)
 
-        if record_type and record_type.lower() in ('txt', 'caa'):
+        if record_type and record_type.lower() in RECORD_TYPES:
             rt = record_type.lower()
         else:
             rt, _ = self.effective_record_type()
@@ -421,7 +422,7 @@ WantedBy=multi-user.target"""
 
     def set_server_record_type(self, server_id: int, record_type: str) -> Dict[str, any]:
         record_type = (record_type or '').lower()
-        if record_type not in ('txt', 'caa'):
+        if record_type not in RECORD_TYPES:
             return {'success': False, 'error': 'record_type inválido'}
 
         server = self.db.get_server(server_id)
