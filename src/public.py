@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ConversationHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
 import config
@@ -7,11 +7,13 @@ from database import Database
 from lib.helpers import is_admin, escape_html, can_create_account
 from src.menus import get_main_menu, get_password_menu
 from lib.vaydns_manager import VayDNSManager
-from lib.slipstream_manager import SlipstreamManager
+from lib.ssh_accounts_manager import SSHAccountsManager
+from lib.wireguard_manager import WireGuardManager
 
 db = Database(config.DB_PATH)
 vaydns = VayDNSManager(db)
-slipstream = SlipstreamManager(db)
+ssh_accounts = SSHAccountsManager(db)
+wireguard = WireGuardManager(db)
 
 # Estados
 CREATE_SSH_USER = 1
@@ -50,41 +52,96 @@ async def show_status(query, is_admin_user):
     await query.edit_message_text(text, parse_mode='HTML', reply_markup=get_main_menu(is_admin_user))
 
 
-async def show_my_account(query):
-    data = db.get_user(query.from_user.id)
-    if not data:
+async def show_my_accounts(query):
+    """Lista todas las cuentas del usuario con botones ver/borrar."""
+    accounts = db.get_user_accounts(query.from_user.id)
+    is_admin_user = is_admin(query.from_user.id)
+
+    if not accounts:
         await query.edit_message_text(
-            "❌ <b>No tienes un SSH activo</b>\n\n💡 Usa el botón Crear SSH.",
+            "❌ <b>No tenés cuentas activas</b>\n\n💡 Usá ➕ Crear SSH o 🛡️ WireGuard.",
             parse_mode='HTML',
-            reply_markup=get_main_menu(False)
+            reply_markup=get_main_menu(is_admin_user)
         )
         return
 
-    expires = datetime.fromisoformat(data['expires_at'])
-    days = (expires - datetime.now()).days
+    text = "👤 <b>Mis Cuentas</b>\n\nTocá 👁️ para ver el config o 🗑️ para borrar.\n\n"
+    keyboard = []
+    for a in accounts:
+        try:
+            days = (datetime.fromisoformat(a['expires_at']) - datetime.now()).days
+        except (ValueError, TypeError):
+            days = 0
+        emoji = "🟢" if days > 0 else "🔴"
+        typ = "🛡️WG" if a.get('conn_type') == 'wireguard' else "🔑SSH"
+        text += f"{emoji} {typ} <b>{escape_html(a['username'])}</b> — {days}d\n"
+        keyboard.append([
+            InlineKeyboardButton(f"👁️ {a['username'][:12]}", callback_data=f"myacc_view_{a['id']}"),
+            InlineKeyboardButton("🗑️", callback_data=f"myacc_del_{a['id']}"),
+        ])
 
-    if days < 0:
-        db.deactivate_user(query.from_user.id)
-        await query.edit_message_text(
-            "⛔ <b>Tu SSH ha expirado</b>",
-            parse_mode='HTML',
-            reply_markup=get_main_menu(False)
-        )
+    keyboard.append([InlineKeyboardButton("◀️ Menú", callback_data='back_to_main')])
+    await query.edit_message_text(text[:4000], parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+def _owns(query, account):
+    return account and account.get('telegram_id') == query.from_user.id
+
+
+async def show_myacc_view(query):
+    account_id = int(query.data.replace('myacc_view_', ''))
+    a = db.get_user_by_id(account_id)
+    if not _owns(query, a):
+        await query.answer("⛔ Esa cuenta no es tuya", show_alert=True)
         return
 
-    text = f"""
-👤 <b>Mi SSH</b>
+    try:
+        days = (datetime.fromisoformat(a['expires_at']) - datetime.now()).days
+    except (ValueError, TypeError):
+        days = 0
 
-👤 Usuario: {escape_html(data['username'])}
-🖥️ Servidor: {escape_html(data['server_name'])}
-📅 Creado: {escape_html(data['created_at'])}
-⏳ Expira: {escape_html(data['expires_at'])}
-📆 Días restantes: <b>{days}</b>
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Volver", callback_data='my_account')]])
 
-🔗 <b>Link:</b>
-<code>{escape_html(data['vaydns_url'])}</code>
-"""
-    await query.edit_message_text(text, parse_mode='HTML', reply_markup=get_main_menu(False))
+    if a.get('conn_type') == 'wireguard':
+        server = db.get_server(a['server_id'])
+        endpoint = f"{server['ip']}:51820" if server else ""
+        conf = wireguard.client_conf(a.get('wg_privkey', ''), a.get('wg_ip', ''),
+                                     db.get_config('wg_pubkey') or '', endpoint)
+        text = (f"🛡️ <b>WireGuard: {escape_html(a['username'])}</b>\n"
+                f"📆 Días: <b>{days}</b> · 🌐 IP: <code>{escape_html(a.get('wg_ip', ''))}</code>\n\n"
+                f"🔗 <b>Config:</b>\n<pre>{escape_html(conf)}</pre>")
+    else:
+        pass_line = f"🔑 Contraseña: <code>{escape_html(a['password'])}</code>\n" if a.get('password') else ""
+        text = (f"🔑 <b>SSH: {escape_html(a['username'])}</b>\n"
+                f"{pass_line}📆 Días: <b>{days}</b>\n\n"
+                f"🔗 <b>Config:</b>\n<code>{escape_html(a.get('vaydns_url') or 'N/A')}</code>")
+
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=back_kb)
+
+
+async def myacc_delete(query):
+    account_id = int(query.data.replace('myacc_del_', ''))
+    a = db.get_user_by_id(account_id)
+    if not _owns(query, a):
+        await query.answer("⛔ Esa cuenta no es tuya", show_alert=True)
+        return
+
+    try:
+        if a.get('conn_type') == 'wireguard':
+            db.delete_user_by_id(account_id)
+            if a.get('server_id'):
+                wireguard.rebuild(a['server_id'])
+        else:
+            if a.get('username') and a.get('server_id'):
+                ssh_accounts.delete_user(a['server_id'], a['username'])
+            db.delete_user_by_id(account_id)
+    except Exception as e:
+        print(f"Error borrando cuenta propia: {e}")
+        db.delete_user_by_id(account_id)
+
+    db.add_log('USER_DELETE_OWN', f"Usuario borró su cuenta {a.get('username')}", query.from_user.id)
+    await query.answer("✅ Cuenta eliminada", show_alert=True)
+    await show_my_accounts(query)
 
 
 # ==========================================
@@ -100,7 +157,11 @@ async def button_handler_public(update: Update, context: ContextTypes.DEFAULT_TY
     if data == 'status':
         await show_status(query, is_admin_user)
     elif data == 'my_account':
-        await show_my_account(query)
+        await show_my_accounts(query)
+    elif data.startswith('myacc_view_'):
+        await show_myacc_view(query)
+    elif data.startswith('myacc_del_'):
+        await myacc_delete(query)
     elif data == 'create_account':
         return await start_create_ssh(update, context)
     elif data == 'back_to_main':
@@ -132,12 +193,28 @@ async def start_create_ssh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # Admin NO tiene límite: puede crear múltiples SSH
-    # Usuarios normales: solo 1 activo
-    if not is_admin(user_id):
-        if db.get_user(user_id):
+    # Límites según el plan. Admin = sin límite.
+    if is_admin(user_id):
+        context.user_data['caps'] = None  # sin límite
+    else:
+        if db.is_reseller_active(user_id):
+            r = db.get_reseller(user_id)
+            caps = {
+                'max_accounts': r['max_accounts'],
+                'max_conn': r['max_conn'],
+                'max_days': r['max_days'],
+            }
+        else:
+            # Modo público sin plan: plan libre por defecto
+            caps = {'max_accounts': 1, 'max_conn': 3, 'max_days': 30}
+        context.user_data['caps'] = caps
+
+        used = db.count_user_accounts(user_id)
+        if used >= caps['max_accounts']:
             await reply(
-                "❌ <b>Ya tienes un SSH activo</b>\n\nUsa el botón Mi SSH.",
+                f"❌ <b>Llegaste a tu límite de cuentas</b>\n\n"
+                f"Tu plan permite <b>{caps['max_accounts']}</b> cuenta(s) y ya tenés <b>{used}</b>.\n"
+                f"Borrá una o pedí ampliar tu plan.",
                 parse_mode='HTML',
                 reply_markup=get_main_menu(is_admin(user_id))
             )
@@ -155,14 +232,20 @@ async def start_create_ssh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(
         "🔧 <b>Crear SSH</b>\n\n"
         "📝 Escribe el <b>nombre de usuario</b>:\n"
-        "(Ejemplo: cliente1, juan, maria)",
+        "(minúsculas, números, - o _ ; ejemplo: cliente1, juan, maria)",
         parse_mode='HTML'
     )
     return CREATE_SSH_USER
 
 
 async def create_ssh_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.text.strip()
+    user = update.message.text.strip().lower()
+    # Validación local rápida (la real la hace el manager)
+    if not ssh_accounts._valid_username(user):
+        await update.message.reply_text(
+            "❌ Usuario inválido. Usá minúsculas, números, - o _, y que empiece con letra. Intenta de nuevo:"
+        )
+        return CREATE_SSH_USER
     context.user_data['ssh_user'] = user
     await update.message.reply_text(
         f"👤 Usuario: <b>{escape_html(user)}</b>\n\n"
@@ -176,7 +259,7 @@ async def create_ssh_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_ssh_password_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    password = slipstream.generate_password(12)
+    password = ssh_accounts.generate_password(12)
     context.user_data['ssh_password'] = password
     await query.edit_message_text(
         f"🎲 <b>Contraseña generada:</b> <code>{escape_html(password)}</code>\n\n"
@@ -207,6 +290,16 @@ async def create_ssh_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = int(update.message.text.strip())
         if days <= 0:
             raise ValueError
+
+        caps = context.user_data.get('caps')
+        if caps and days > caps['max_days']:
+            await update.message.reply_text(
+                f"❌ Tu plan permite <b>máximo {caps['max_days']} días</b>.\n"
+                f"Escribí <b>{caps['max_days']}</b> o menos:",
+                parse_mode='HTML'
+            )
+            return CREATE_SSH_DAYS
+
         context.user_data['ssh_days'] = days
         await update.message.reply_text(
             f"📅 Días: <b>{days}</b>\n\n"
@@ -228,126 +321,91 @@ async def create_ssh_devices(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         devices = 3
 
+    capped_note = ""
+    caps = context.user_data.get('caps')
+    if caps and devices > caps['max_conn']:
+        devices = caps['max_conn']
+        capped_note = f"⚠️ Tu plan permite máximo {caps['max_conn']} conexiones; se ajustó a {devices}.\n\n"
+
     user = context.user_data.get('ssh_user', 'user')
     days = context.user_data.get('ssh_days', 30)
-    password = context.user_data.get('ssh_password', slipstream.generate_password(12))
+    password = context.user_data.get('ssh_password', ssh_accounts.generate_password(12))
+    user_id = update.effective_user.id
 
     servers = db.get_all_servers()
     if not servers:
         await update.message.reply_text("❌ No hay servidor.")
+        context.user_data.clear()
         return ConversationHandler.END
 
     server = servers[0]
     server_id = server['id']
-    user_id = update.effective_user.id
 
-    # Detectar qué backend está instalado
-    vaydns_ok = vaydns.is_vaydns_installed(server_id)
-    slipgate_ok = slipstream.is_slipgate_installed(server_id)
-
-    if not vaydns_ok and not slipgate_ok:
+    if not ssh_accounts.is_backend_installed(server_id):
         await update.message.reply_text(
-            "❌ <b>No hay backend instalado</b>\n\n"
-            "Pide al admin que instale VayDNS o Slipstream.",
+            "❌ <b>El backend SSH no está instalado</b>\n\n"
+            "Pedile al admin que instale VayDNS (con backend SSH) primero.",
             parse_mode='HTML',
             reply_markup=get_main_menu(is_admin(user_id))
         )
+        context.user_data.clear()
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        f"🌀 <b>Creando SSH '{escape_html(user)}'...</b>\n\n⏳",
+    creando = await update.message.reply_text(
+        f"{capped_note}🌀 <b>Creando cuenta '{escape_html(user)}'...</b>\n\n⏳",
         parse_mode='HTML'
     )
 
-    # ─── SLIPSTREAM ───
-    if slipgate_ok:
-        result = slipstream.create_user(server_id, user, password)
-
-        if not result['success']:
-            await update.message.reply_text(
-                f"❌ <b>Error creando SSH:</b>\n\n{escape_html(result.get('error', 'Error'))}",
-                parse_mode='HTML',
-                reply_markup=get_main_menu(is_admin(user_id))
-            )
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        # Aplicar límite de conexiones
-        slipstream.set_user_limit(server_id, user, devices)
-
-        # Guardar en DB
-        expires_at = (datetime.now() + timedelta(days=days)).isoformat()
-        db.add_user(user_id, user, server_id, result['url'], expires_at)
-        db.add_log('CREATE_SSH_SLIP', f"SSH {user} creado ({days}d, {devices} conexiones) - Slipstream", user_id)
-
-        text = f"""
-✅ <b>¡SSH Creado!</b>
-
-━━━━━━━━━━━━━━━━━━━
-📋 <b>Datos</b>
-━━━━━━━━━━━━━━━━━━━
-👤 <b>Usuario:</b> <code>{escape_html(user)}</code>
-🔑 <b>Contraseña:</b> <code>{escape_html(password)}</code>
-📅 <b>Días:</b> {days}
-📱 <b>Conexiones máx:</b> {devices}
-⏳ <b>Expira:</b> {expires_at[:10]}
-
-━━━━━━━━━━━━━━━━━━━
-🔗 <b>Enlace SlipNet:</b>
-<code>{escape_html(result['url'])}</code>
-
-━━━━━━━━━━━━━━━━━━━
-📱 <b>Instrucciones:</b>
-1️⃣ Abrir SlipNet
-2️⃣ Menú (3 puntos) → Import Profiles
-3️⃣ Pegar el enlace
-4️⃣ Guardar y conectar
-"""
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_main_menu(is_admin(user_id)))
-
-    # ─── VAYDNS ───
-    else:
-        pubkey = server.get('pubkey') or ''
-        if not pubkey:
-            await update.message.reply_text(
-                "❌ Servidor sin pubkey. Reinstala VayDNS.",
-                reply_markup=get_main_menu(is_admin(user_id))
-            )
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        default = config.DEFAULT_SERVER
-        tunnel = default.get('tunnel_domain', f"d.{'.'.join(server['domain'].split('.')[1:])}")
-        url = (
-            f"dnst://{tunnel}/vaydns/socks5?"
-            f"pubkey={pubkey}&record-type={default.get('record_type', 'txt')}"
-            f"&clientid-size={default.get('clientid_size', 8)}"
-            f"&keepalive=2s&idle-timeout=10s"
-            f"&dnstt-compat={'true' if default.get('dnstt_compat', True) else 'false'}"
-            f"#vaydns"
+    result = ssh_accounts.create_user(server_id, user, password, days, devices)
+    if not result['success']:
+        try:
+            await creando.delete()
+        except Exception:
+            pass
+        await update.message.reply_text(
+            f"❌ <b>Error creando la cuenta:</b>\n\n{escape_html(result.get('error', 'Error'))}",
+            parse_mode='HTML',
+            reply_markup=get_main_menu(is_admin(user_id))
         )
-        expires_at = (datetime.now() + timedelta(days=days)).isoformat()
+        context.user_data.clear()
+        return ConversationHandler.END
 
-        db.add_user(user_id, user, server_id, url, expires_at)
-        db.add_log('CREATE_SSH_VAYDNS', f"SSH {user} creado ({days}d) - VayDNS", user_id)
+    # El tipo (TXT/CAA) lo define el servidor, no la cuenta
+    cfg = ssh_accounts.client_config(server, user, password)
+    expires_at = (datetime.now() + timedelta(days=days)).isoformat()
 
-        text = f"""
-✅ <b>¡SSH Creado!</b>
+    db.add_user(user_id, user, server_id, cfg['url'], expires_at, password=password, max_conn=devices)
+    db.add_log('CREATE_SSH', f"Cuenta {user} creada ({days}d, {devices} conex, {cfg['record_type']})", user_id)
+
+    app_url = getattr(config, 'APP_DOWNLOAD_URL', 'https://play.google.com/store')
+    download_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Descargar App", url=app_url)]
+    ])
+
+    text = f"""
+✅ <b>¡Cuenta Creada!</b>
 
 ━━━━━━━━━━━━━━━━━━━
 📋 <b>Datos</b>
 ━━━━━━━━━━━━━━━━━━━
 👤 <b>Usuario:</b> <code>{escape_html(user)}</code>
 🔑 <b>Contraseña:</b> <code>{escape_html(password)}</code>
+💻 <b>Tunnel Domain:</b> <code>{escape_html(cfg['tunnel'])}</code>
+🔑 <b>Public Key:</b> <code>{escape_html(cfg['pubkey'])}</code>
 📅 <b>Días:</b> {days}
 📱 <b>Conexiones máx:</b> {devices}
 ⏳ <b>Expira:</b> {expires_at[:10]}
 
 ━━━━━━━━━━━━━━━━━━━
-🔗 <b>Enlace VayDNS:</b>
-<code>{escape_html(url)}</code>
+🔗 <b>Config (importar en la app):</b>
+<code>{escape_html(cfg['url'])}</code>
+━━━━━━━━━━━━━━━━━━━
 """
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_main_menu(is_admin(user_id)))
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=download_kb)
+    try:
+        await creando.delete()
+    except Exception:
+        pass
 
     context.user_data.clear()
     return ConversationHandler.END
