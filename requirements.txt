@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]==20.7
 paramiko==3.4.0
 python-dotenv==1.0.0
+qrcode[pil]==7.4.2
