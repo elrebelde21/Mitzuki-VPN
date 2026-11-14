@@ -1,0 +1,31 @@
+[Unit]
+Description=Soar Tunnel Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=vaydns
+Group=vaydns
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/bin/soar-server -listen :5300 -key-file /etc/soar/server.key -zone t.example.com -allow-ports any
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=5
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+ReadWritePaths=/etc/soar
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
+

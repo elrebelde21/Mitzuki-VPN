@@ -1,3 +1,4 @@
+import os
 import config
 import paramiko
 import random
@@ -74,10 +75,19 @@ class VayDNSManager:
         }
 
     def install_vaydns(self, server_id: int) -> Dict[str, any]:
-        """Instala VayDNS con configuración DNSTT (compatible con Cuba)"""
+        """Instala VayDNS subiendo el binario local lib/vaydns-server (como deploy_vaydns_local.py).
+
+        Núcleo: dependencias, binario, claves, Dante SOCKS5, servicio systemd y verificación.
+        NO toca firewall ni el puerto SSH.
+        """
         server = self.db.get_server(server_id)
         if not server:
             return {'success': False, 'error': 'Servidor no encontrado'}
+
+        # Binario local en la misma carpeta que este módulo (lib/vaydns-server)
+        local_binary = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vaydns-server')
+        if not os.path.exists(local_binary):
+            return {'success': False, 'error': f'No se encontró el binario local: {local_binary}'}
 
         ssh = self.connect_ssh(server['ip'], server['ssh_port'], server['username'], server['password'])
         if not ssh:
@@ -86,41 +96,103 @@ class VayDNSManager:
         try:
             os_info = self.detect_os(ssh, server['password'], server['username'])
             default = config.DEFAULT_SERVER
+            port = default.get('port', 53)
+            user = server['username']
+            pwd = server['password']
 
-            print("Actualizando sistema...")
+            # Parámetros del servicio (deben coincidir con la URL del cliente)
+            record_type = default.get('record_type', 'txt')
+            dnstt_compat = default.get('dnstt_compat', True)
+            dnstt_flag = '-dnstt-compat ' if dnstt_compat else ''
+            idle_timeout = '10s'
+            keepalive = '2s'
+            mtu = '1232'
+
+            # ---- 0. Puerto libre ----
+            _, out, _ = self.run_cmd(
+                ssh,
+                f"ss -ulnp 2>/dev/null | grep -E ':{port}([[:space:]]|$)' || true",
+                pwd, user, hide_output=True
+            )
+            if out.strip():
+                ssh.close()
+                return {'success': False, 'error': f'Puerto {port}/udp ya está en uso:\n{out}'}
+
+            # ---- 1. Dependencias (sin Go ni git: ya no compilamos) ----
+            print("Actualizando sistema e instalando dependencias...")
             if os_info['is_ubuntu']:
-                self.run_cmd(ssh, "export DEBIAN_FRONTEND=noninteractive && apt-get update -y",
-                             server['password'], server['username'])
-                self.run_cmd(ssh, "export DEBIAN_FRONTEND=noninteractive && apt-get install -y tar dante-server iptables iptables-persistent curl vnstat sed tcpdump net-tools bind9-dnsutils wget xz-utils",
-                             server['password'], server['username'])
+                self.run_cmd(ssh, "export DEBIAN_FRONTEND=noninteractive && apt-get update -y", pwd, user)
+                self.run_cmd(ssh, "export DEBIAN_FRONTEND=noninteractive && apt-get install -y "
+                                  "dante-server curl vnstat net-tools bind9-dnsutils ca-certificates",
+                             pwd, user)
             else:
-                self.run_cmd(ssh, "dnf update -y", server['password'], server['username'])
-                self.run_cmd(ssh, "dnf install -y epel-release", server['password'], server['username'])
-                self.run_cmd(ssh, "dnf install -y tar dante-server firewalld curl tcpdump net-tools bind-utils vnstat sed wget xz",
-                             server['password'], server['username'])
+                self.run_cmd(ssh, "dnf install -y epel-release", pwd, user)
+                self.run_cmd(ssh, "dnf install -y dante-server curl net-tools bind-utils vnstat "
+                                  "ca-certificates policycoreutils-python-utils",
+                             pwd, user)
 
+            # ---- 2. Subir binario local por SFTP ----
+            print("Subiendo binario vaydns-server...")
+            # Paramos un servicio previo para evitar "text file busy" al mover el binario
+            self.run_cmd(ssh, "systemctl stop vaydns-server 2>/dev/null || true", pwd, user)
+            try:
+                sftp = ssh.open_sftp()
+                sftp.put(local_binary, "/tmp/vaydns-server")
+                sftp.close()
+            except Exception as e:
+                ssh.close()
+                return {'success': False, 'error': f'No se pudo subir el binario: {e}'}
+
+            self.run_cmd(ssh,
+                         "chmod +x /tmp/vaydns-server && "
+                         "mv /tmp/vaydns-server /usr/local/bin/vaydns-server && "
+                         "chmod 755 /usr/local/bin/vaydns-server",
+                         pwd, user)
+
+            _, ftype, _ = self.run_cmd(ssh, "file /usr/local/bin/vaydns-server 2>/dev/null || true", pwd, user, hide_output=True)
+            if 'ELF' not in ftype:
+                ssh.close()
+                return {'success': False, 'error': f'El binario subido no es válido (ELF):\n{ftype}'}
+
+            # SELinux (RHEL/Rocky/Alma): marcar el binario como ejecutable
+            if not os_info['is_ubuntu']:
+                self.run_cmd(ssh, 'semanage fcontext -a -t bin_t "/usr/local/bin/vaydns-server" 2>/dev/null || true', pwd, user)
+                self.run_cmd(ssh, "restorecon -v /usr/local/bin/vaydns-server 2>/dev/null || true", pwd, user)
+
+            # ---- 3. Usuario vaydns ----
             print("Creando usuario vaydns...")
-            self.run_cmd(ssh, "id -u vaydns &>/dev/null || useradd -r -M -s /bin/false -c 'vaydns service user' -d /nonexistent vaydns",
-                         server['password'], server['username'])
+            self.run_cmd(ssh,
+                         "id -u vaydns &>/dev/null || "
+                         "useradd -r -M -s /bin/false -c 'vaydns service user' -d /nonexistent vaydns",
+                         pwd, user)
 
-            print("Descargando y configurando VayDNS...")
-            binary_url = "https://raw.githubusercontent.com/phoenixdnsvpn/phoenix-vpn/main/scripts/vaydns-server"
-            setup_cmds = f"""
-                cd /tmp
-                curl -sL {binary_url} -o vaydns-server
-                chmod +x vaydns-server
-                ./vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
-                mkdir -p /etc/vaydns
-                mv server.key server.pub /etc/vaydns/
-                chown -R vaydns:vaydns /etc/vaydns
-                mv vaydns-server /usr/local/bin/
-                chmod 755 /usr/local/bin/vaydns-server
-            """
-            self.run_cmd(ssh, setup_cmds, server['password'], server['username'])
+            # ---- 4. Claves ----
+            print("Generando claves...")
+            self.run_cmd(ssh, "rm -rf /etc/vaydns && mkdir -p /etc/vaydns", pwd, user)
+            exit_code, out, err = self.run_cmd(
+                ssh,
+                "/usr/local/bin/vaydns-server -gen-key "
+                "-privkey-file /etc/vaydns/server.key "
+                "-pubkey-file /etc/vaydns/server.pub",
+                pwd, user
+            )
+            if exit_code != 0:
+                ssh.close()
+                return {'success': False, 'error': f'-gen-key falló: {err}\n{out}'}
 
-            print("Configurando proxy SOCKS5...")
-            _, primary_interface, _ = self.run_cmd(ssh, "ip route | awk '/default/ {print $5}' | head -n1",
-                                                   server['password'], server['username'], hide_output=True)
+            _, pubkey, err = self.run_cmd(ssh, "cat /etc/vaydns/server.pub", pwd, user, hide_output=True)
+            pubkey = pubkey.strip()
+            if not pubkey:
+                ssh.close()
+                return {'success': False, 'error': f'server.pub vacío: {err}'}
+
+            self.run_cmd(ssh, "chown -R vaydns:vaydns /etc/vaydns", pwd, user)
+
+            # ---- 5. SOCKS5 dante ----
+            print("Configurando SOCKS5...")
+            _, primary_interface, _ = self.run_cmd(
+                ssh, "ip route | awk '/default/ {print $5}' | head -n1", pwd, user, hide_output=True
+            )
             if not primary_interface:
                 primary_interface = "eth0"
 
@@ -142,25 +214,22 @@ socks pass {{
 }}"""
 
             config_path = os_info['dante_config_path']
-            self.run_cmd(ssh, f"mv {config_path} {config_path}.1 || true", server['password'], server['username'])
-            write_cmd = f"cat > {config_path} << 'EOF'\n{sockd_content}\nEOF"
-            self.run_cmd(ssh, write_cmd, server['password'], server['username'])
+            self.run_cmd(ssh, f"mv {config_path} {config_path}.1 || true", pwd, user)
+            self.run_cmd(ssh, f"cat > {config_path} << 'EOF'\n{sockd_content}\nEOF", pwd, user)
+            self.run_cmd(ssh, "systemctl daemon-reload", pwd, user)
+            self.run_cmd(ssh, f"systemctl restart {os_info['dante_service']}", pwd, user)
+            self.run_cmd(ssh, f"systemctl enable {os_info['dante_service']}", pwd, user)
 
-            self.run_cmd(ssh, "systemctl daemon-reload", server['password'], server['username'])
-            self.run_cmd(ssh, f"systemctl start {os_info['dante_service']}", server['password'], server['username'])
-            self.run_cmd(ssh, f"systemctl enable {os_info['dante_service']}", server['password'], server['username'])
+            # ---- 6. DNS sistema ----
+            self.run_cmd(ssh, "rm -f /etc/resolv.conf", pwd, user)
+            self.run_cmd(ssh, "echo 'nameserver 1.1.1.1' > /etc/resolv.conf", pwd, user)
+            self.run_cmd(ssh, "echo 'nameserver 8.8.8.8' >> /etc/resolv.conf", pwd, user)
 
-            print("Arreglando DNS del sistema...")
-            self.run_cmd(ssh, "rm -f /etc/resolv.conf", server['password'], server['username'])
-            self.run_cmd(ssh, "echo 'nameserver 1.1.1.1' > /etc/resolv.conf", server['password'], server['username'])
-            self.run_cmd(ssh, "echo 'nameserver 8.8.8.8' >> /etc/resolv.conf", server['password'], server['username'])
-
+            # ---- 7. Servicio systemd (sintaxis VayDNS: -domain / -upstream) ----
             print("Creando servicio systemd...")
-            tunnel_domain = default.get('tunnel_domain', f"d.{'.'.join(server['domain'].split('.')[1:])}")
-            port = default.get('port', 53)
-            record_type = default.get('record_type', 'txt')
-            dnstt_compat = default.get('dnstt_compat', True)
-            dnstt_flag = '-dnstt-compat' if dnstt_compat else ''
+            tunnel_domain = default.get('tunnel_domain',
+                                        f"d.{'.'.join(server['domain'].split('.')[1:])}")
+            upstream = "127.0.0.1:8000"
 
             vaydns_service = f"""[Unit]
 Description=VayDNS Tunnel Server
@@ -173,7 +242,7 @@ User=vaydns
 Group=vaydns
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/vaydns-server -udp :{port} -privkey-file /etc/vaydns/server.key -mtu 1232 -record-type {record_type} {dnstt_flag} -idle-timeout 10s -keepalive 2s -domain {tunnel_domain} -upstream 127.0.0.1:8000
+ExecStart=/usr/local/bin/vaydns-server -udp :{port} -privkey-file /etc/vaydns/server.key -mtu {mtu} -record-type {record_type} {dnstt_flag}-idle-timeout {idle_timeout} -keepalive {keepalive} -domain {tunnel_domain} -upstream {upstream}
 Restart=always
 RestartSec=5
 KillMode=mixed
@@ -192,25 +261,33 @@ ProtectControlGroups=true
 [Install]
 WantedBy=multi-user.target"""
 
-            write_cmd = f"cat > /etc/systemd/system/vaydns-server.service << 'EOF'\n{vaydns_service}\nEOF"
-            self.run_cmd(ssh, write_cmd, server['password'], server['username'])
+            self.run_cmd(ssh, "rm -rf /etc/systemd/system/vaydns-server.service.d", pwd, user)
+            self.run_cmd(ssh, f"cat > /etc/systemd/system/vaydns-server.service << 'EOF'\n{vaydns_service}\nEOF", pwd, user)
 
-            self.run_cmd(ssh, "systemctl daemon-reload", server['password'], server['username'])
-            self.run_cmd(ssh, "systemctl start vaydns-server", server['password'], server['username'])
-            self.run_cmd(ssh, "systemctl enable vaydns-server", server['password'], server['username'])
+            self.run_cmd(ssh, "systemctl daemon-reload", pwd, user)
+            self.run_cmd(ssh, "systemctl enable vaydns-server", pwd, user)
+            self.run_cmd(ssh, "systemctl restart vaydns-server", pwd, user)
 
-            print("Obteniendo clave pública...")
-            _, pubkey, _ = self.run_cmd(ssh, "cat /etc/vaydns/server.pub", server['password'], server['username'],
-                                        hide_output=True)
-            pubkey = pubkey.strip()
+            # ---- 8. Verificar ----
+            _, status, _ = self.run_cmd(ssh, "systemctl is-active vaydns-server", pwd, user, hide_output=True)
+            if status.strip() != 'active':
+                _, logs, _ = self.run_cmd(ssh, "journalctl -u vaydns-server -n 20 --no-pager", pwd, user, hide_output=True)
+                ssh.close()
+                return {'success': False, 'error': f'Servicio no arrancó:\n{logs}'}
 
-            if pubkey:
-                self.db.update_server_pubkey(server_id, pubkey)
+            _, ss_out, _ = self.run_cmd(
+                ssh,
+                f"ss -ulnp 2>/dev/null | grep -E ':{port}([[:space:]]|$)' || true",
+                pwd, user, hide_output=True
+            )
+            if not ss_out.strip():
+                print(f"[WARN] Servicio activo pero ss no muestra :{port}/udp. Salida: {ss_out!r}")
 
+            # ---- 9. Guardar pubkey + URLs ----
+            self.db.update_server_pubkey(server_id, pubkey)
             urls = self.generate_client_urls(tunnel_domain, pubkey)
 
             ssh.close()
-
             return {
                 'success': True,
                 'message': 'VayDNS instalado correctamente',
@@ -219,11 +296,14 @@ WantedBy=multi-user.target"""
             }
 
         except Exception as e:
-            ssh.close()
+            try:
+                ssh.close()
+            except:
+                pass
             return {'success': False, 'error': str(e)}
 
     def generate_client_urls(self, domain: str, pubkey: str) -> List[str]:
-        """Genera URL con configuración DNSTT (compatible con Cuba)"""
+        """Genera URL completa compatible con Phoenix VPN / VayDNS."""
         if not pubkey:
             return []
 
@@ -248,7 +328,7 @@ WantedBy=multi-user.target"""
         try:
             _, status, _ = self.run_cmd(ssh, "systemctl is-active vaydns-server", server['password'], server['username'],
                                         hide_output=True)
-            _, ports, _ = self.run_cmd(ssh, "ss -tlnp | grep -E ':53|:5300|:8000'", server['password'],
+            _, ports, _ = self.run_cmd(ssh, "ss -tulnp | grep -E ':53|:5300|:8000'", server['password'],
                                        server['username'], hide_output=True)
             _, pubkey, _ = self.run_cmd(ssh, "cat /etc/vaydns/server.pub", server['password'], server['username'],
                                         hide_output=True)
@@ -278,6 +358,7 @@ WantedBy=multi-user.target"""
             self.run_cmd(ssh, "systemctl stop vaydns-server", server['password'], server['username'])
             self.run_cmd(ssh, "systemctl disable vaydns-server", server['password'], server['username'])
             self.run_cmd(ssh, "rm -f /etc/systemd/system/vaydns-server.service", server['password'], server['username'])
+            self.run_cmd(ssh, "rm -rf /etc/systemd/system/vaydns-server.service.d", server['password'], server['username'])
             self.run_cmd(ssh, "systemctl daemon-reload", server['password'], server['username'])
             self.run_cmd(ssh, "rm -rf /etc/vaydns", server['password'], server['username'])
             self.run_cmd(ssh, "rm -f /usr/local/bin/vaydns-server", server['password'], server['username'])
@@ -304,8 +385,11 @@ WantedBy=multi-user.target"""
             return False
 
         try:
-            _, output, _ = self.run_cmd(ssh, f"ss -ulnp | grep ':{port} '",
-                                        server['password'], server['username'], hide_output=True)
+            _, output, _ = self.run_cmd(
+                ssh,
+                f"ss -ulnp 2>/dev/null | grep -E ':{port}([[:space:]]|$)' || true",
+                server['password'], server['username'], hide_output=True
+            )
             ssh.close()
             return bool(output.strip())
         except:
