@@ -24,7 +24,7 @@ DEFAULT_SERVER = {
     'tunnel_domain': process.env.DEFAULT_SERVER_TUNNEL_DOMAIN,
     'record_type': process.env.DEFAULT_SERVER_RECORD_TYPE,
     'dnstt_compat': process.env.DEFAULT_SERVER_DNSTT,
-    'clientid_size': process.env.DEFAULT_SERVER_CLIENT
+    'clientid_size': process.env.DEFAULT_SERVER_CLIENT,
     'port': process.env.DEFAULT_SERVER_PORT
 }
 
