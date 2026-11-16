@@ -1,23 +1,21 @@
 """
-wireguard_manager.py  —  Backend WireGuard (VPN UDP directa, plano).
+wireguard_manager.py  —  Backend WireGuard (VPN UDP directa).
 
 Convive con VayDNS: WG usa UDP 51820, VayDNS el 53.
 
-- setup_wireguard: instala WG, genera llaves del server, levanta wg0 con NAT.
-- prepare_peer: genera llaves del cliente (X25519) + asigna IP (no toca el server).
-- rebuild: reescribe wg0.conf desde la DB (todos los peers activos) y sincroniza.
-- client_conf: arma el .conf que importa el cliente.
-
-Las llaves del cliente se generan en Python (cryptography), sin SSH.
+- setup_wireguard: instala WG, llaves del server, wg0 con NAT, firewall (ufw/firewalld/iptables).
+- prepare_peer: llaves del cliente (X25519, en Python) + IP libre.
+- rebuild: reescribe wg0.conf desde la DB y lo aplica (syncconf, o reinicio si hace falta).
+- client_conf: el .conf que importa el cliente.
 """
-
 import base64
-import paramiko
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
+import config
+from lib.remote import RemoteMixin, write_file, open_udp_port
 
 WG_PORT = 51820
 WG_SUBNET = "10.7.0"          # /24
@@ -25,177 +23,146 @@ WG_SERVER_IP = "10.7.0.1"
 WG_IFACE = "wg0"
 WG_DIR = "/etc/wireguard"
 CLIENT_DNS = "1.1.1.1, 8.8.8.8"
+CLIENT_MTU = 1280             # seguro para datos móviles / redes con MTU baja
 
 
-class WireGuardManager:
+class WireGuardManager(RemoteMixin):
     def __init__(self, db):
         self.db = db
 
-    # ------------------------------------------------------------------
-    # Llaves WireGuard (X25519) en Python
-    # ------------------------------------------------------------------
     @staticmethod
     def generate_keys() -> Tuple[str, str]:
         priv = X25519PrivateKey.generate()
-        priv_raw = priv.private_bytes(
-            serialization.Encoding.Raw,
-            serialization.PrivateFormat.Raw,
-            serialization.NoEncryption(),
-        )
-        pub_raw = priv.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw
-        )
+        priv_raw = priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                      serialization.NoEncryption())
+        pub_raw = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         return base64.b64encode(priv_raw).decode(), base64.b64encode(pub_raw).decode()
 
-    # ------------------------------------------------------------------
-    # Helpers SSH
-    # ------------------------------------------------------------------
-    def _connect(self, server: Dict) -> Optional[paramiko.SSHClient]:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            ssh.connect(
-                hostname=server['ip'], port=server['ssh_port'],
-                username=server['username'], password=server['password'],
-                timeout=30, allow_agent=False, look_for_keys=False
-            )
-            return ssh
-        except Exception as e:
-            print(f"Error SSH (wireguard): {e}")
-            return None
-
-    def run_cmd(self, ssh, cmd, password, user='root', hide_output=False) -> Tuple[int, str, str]:
-        if user != 'root':
-            cmd = f"sudo -S -p '' bash -c '{cmd}'"
-        stdin, stdout, stderr = ssh.exec_command(cmd)
-        if user != 'root':
-            stdin.write(password + '\n')
-            stdin.flush()
-        code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode('utf-8', errors='ignore').strip()
-        err = stderr.read().decode('utf-8', errors='ignore').strip()
-        return code, out, err
-
     def _is_ubuntu(self, ssh, pwd, user) -> bool:
-        _, out, _ = self.run_cmd(ssh, "cat /etc/os-release", pwd, user, hide_output=True)
+        _, out, _ = self.run_cmd(ssh, "cat /etc/os-release", pwd, user)
         low = out.lower()
         return "ubuntu" in low or "debian" in low
 
+    def endpoint_host(self, server: Dict) -> str:
+        return getattr(config, 'WG_ENDPOINT', '') or server['ip']
+
     # ------------------------------------------------------------------
-    # Render del wg0.conf
+    # wg0.conf
     # ------------------------------------------------------------------
     def _render_conf(self, server_priv: str, iface: str, peers: List[Dict]) -> str:
-        conf = f"""[Interface]
-Address = {WG_SERVER_IP}/24
-ListenPort = {WG_PORT}
-PrivateKey = {server_priv}
-PostUp = iptables -A FORWARD -i {WG_IFACE} -j ACCEPT; iptables -A FORWARD -o {WG_IFACE} -j ACCEPT; iptables -t nat -A POSTROUTING -o {iface} -j MASQUERADE
-PostDown = iptables -D FORWARD -i {WG_IFACE} -j ACCEPT; iptables -D FORWARD -o {WG_IFACE} -j ACCEPT; iptables -t nat -D POSTROUTING -o {iface} -j MASQUERADE
-"""
+        up = (f"iptables -I FORWARD -i {WG_IFACE} -j ACCEPT; iptables -I FORWARD -o {WG_IFACE} -j ACCEPT; "
+              f"iptables -t nat -I POSTROUTING -s {WG_SUBNET}.0/24 -o {iface} -j MASQUERADE; "
+              f"iptables -t mangle -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
+        down = (f"iptables -D FORWARD -i {WG_IFACE} -j ACCEPT; iptables -D FORWARD -o {WG_IFACE} -j ACCEPT; "
+                f"iptables -t nat -D POSTROUTING -s {WG_SUBNET}.0/24 -o {iface} -j MASQUERADE; "
+                f"iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
+        conf = (f"[Interface]\nAddress = {WG_SERVER_IP}/24\nListenPort = {WG_PORT}\n"
+                f"PrivateKey = {server_priv}\nPostUp = {up}\nPostDown = {down}\n")
         for p in peers:
             if p.get('wg_pubkey') and p.get('wg_ip'):
-                conf += f"\n[Peer]\nPublicKey = {p['wg_pubkey']}\nAllowedIPs = {p['wg_ip']}/32\n"
+                conf += (f"\n# {p.get('username', '')}\n[Peer]\nPublicKey = {p['wg_pubkey']}\n"
+                         f"AllowedIPs = {p['wg_ip']}/32\n")
         return conf
+
+    def _write_and_apply(self, ssh, server_id: int, server_priv: str, pwd: str, user: str,
+                         restart: bool = False) -> Dict:
+        _, iface, _ = self.run_cmd(ssh, "ip route | awk '/default/ {print $5}' | head -n1", pwd, user)
+        iface = iface.strip() or "eth0"
+        conf = self._render_conf(server_priv, iface, self.db.get_wg_users(server_id))
+        write_file(ssh, f"{WG_DIR}/{WG_IFACE}.conf", conf, pwd, user, mode='600')
+
+        if not restart:
+            # Aplica peers sin cortar a nadie; si wg0 no está arriba, se reinicia
+            code, _, _ = self.run_cmd(ssh, f"ip link show {WG_IFACE} >/dev/null 2>&1 && "
+                                           f"wg syncconf {WG_IFACE} <(wg-quick strip {WG_IFACE})", pwd, user)
+            restart = code != 0
+        if restart:
+            self.run_cmd(ssh, f"systemctl enable wg-quick@{WG_IFACE} >/dev/null 2>&1; "
+                              f"systemctl restart wg-quick@{WG_IFACE}", pwd, user)
+
+        _, status, _ = self.run_cmd(ssh, f"systemctl is-active wg-quick@{WG_IFACE}", pwd, user)
+        if status.strip() != 'active':
+            _, logs, _ = self.run_cmd(ssh, f"journalctl -u wg-quick@{WG_IFACE} -n 15 --no-pager", pwd, user)
+            return {'success': False, 'error': f'WireGuard no está activo:\n{logs[-1500:]}'}
+        return {'success': True}
 
     # ------------------------------------------------------------------
     # Instalación
     # ------------------------------------------------------------------
-    def setup_wireguard(self, server_id: int) -> Dict[str, any]:
+    def setup_wireguard(self, server_id: int) -> Dict:
         server = self.db.get_server(server_id)
         if not server:
             return {'success': False, 'error': 'Servidor no encontrado'}
         ssh = self._connect(server)
         if not ssh:
-            return {'success': False, 'error': 'No se pudo conectar al servidor'}
-
+            return {'success': False, 'error': 'No se pudo conectar a la VPS por SSH'}
         pwd, user = server['password'], server['username']
         try:
-            is_ubuntu = self._is_ubuntu(ssh, pwd, user)
-
-            if is_ubuntu:
-                self.run_cmd(ssh, "export DEBIAN_FRONTEND=noninteractive && apt-get update -y", pwd, user)
-                self.run_cmd(ssh, "export DEBIAN_FRONTEND=noninteractive && "
-                                  "apt-get install -y wireguard wireguard-tools iptables", pwd, user)
+            if self._is_ubuntu(ssh, pwd, user):
+                self.run_cmd(ssh, "export DEBIAN_FRONTEND=noninteractive; apt-get update -y -q; "
+                                  "apt-get install -y -q wireguard wireguard-tools iptables", pwd, user)
             else:
-                self.run_cmd(ssh, "dnf install -y epel-release || true", pwd, user)
-                self.run_cmd(ssh, "dnf install -y wireguard-tools iptables || "
+                self.run_cmd(ssh, "dnf install -y epel-release; dnf install -y wireguard-tools iptables || "
                                   "yum install -y wireguard-tools iptables", pwd, user)
 
-            self.run_cmd(ssh, f"mkdir -p {WG_DIR} && chmod 700 {WG_DIR}", pwd, user)
+            code, _, _ = self.run_cmd(ssh, "command -v wg >/dev/null && command -v wg-quick >/dev/null", pwd, user)
+            if code != 0:
+                return {'success': False, 'error': 'No se pudo instalar wireguard-tools en la VPS'}
 
-            # Llaves del server (si no existen)
-            self.run_cmd(ssh,
-                         f"test -f {WG_DIR}/server_private.key || "
-                         f"(wg genkey | tee {WG_DIR}/server_private.key | wg pubkey > {WG_DIR}/server_public.key)",
+            self.run_cmd(ssh, f"mkdir -p {WG_DIR} && chmod 700 {WG_DIR}; "
+                              f"test -s {WG_DIR}/server_private.key || "
+                              f"(umask 077; wg genkey | tee {WG_DIR}/server_private.key | wg pubkey > {WG_DIR}/server_public.key)",
                          pwd, user)
-            self.run_cmd(ssh, f"chmod 600 {WG_DIR}/server_private.key", pwd, user)
-
-            _, server_priv, _ = self.run_cmd(ssh, f"cat {WG_DIR}/server_private.key", pwd, user, hide_output=True)
-            _, server_pub, _ = self.run_cmd(ssh, f"cat {WG_DIR}/server_public.key", pwd, user, hide_output=True)
-            server_priv = server_priv.strip()
-            server_pub = server_pub.strip()
+            _, server_priv, _ = self.run_cmd(ssh, f"cat {WG_DIR}/server_private.key", pwd, user)
+            _, server_pub, _ = self.run_cmd(ssh, f"cat {WG_DIR}/server_private.key | wg pubkey", pwd, user)
+            server_priv, server_pub = server_priv.strip(), server_pub.strip()
             if not server_priv or not server_pub:
-                ssh.close()
                 return {'success': False, 'error': 'No se generaron las llaves del servidor'}
 
-            # Interfaz de salida
-            _, iface, _ = self.run_cmd(ssh, "ip route | awk '/default/ {print $5}' | head -n1", pwd, user, hide_output=True)
-            iface = iface.strip() or "eth0"
+            # Reenvío de paquetes (IPv4) + firewall
+            self.run_cmd(ssh, "printf 'net.ipv4.ip_forward=1\\n' > /etc/sysctl.d/99-mitzuki-wg.conf; "
+                              "sysctl -w net.ipv4.ip_forward=1 >/dev/null", pwd, user)
+            open_udp_port(ssh, WG_PORT, pwd, user)
+            self.run_cmd(ssh, "if command -v ufw >/dev/null 2>&1 && ufw status | grep -q 'Status: active'; then "
+                              "sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY=\"ACCEPT\"/' /etc/default/ufw; "
+                              "ufw reload >/dev/null 2>&1; fi; "
+                              "if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then "
+                              "firewall-cmd --permanent --add-masquerade >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi; true",
+                         pwd, user)
 
-            # Reconstruir conf con los peers que ya existan en DB
-            peers = self.db.get_wg_users(server_id)
-            conf = self._render_conf(server_priv, iface, peers)
-            self.run_cmd(ssh, f"cat > {WG_DIR}/{WG_IFACE}.conf << 'EOF'\n{conf}EOF", pwd, user)
-            self.run_cmd(ssh, f"chmod 600 {WG_DIR}/{WG_IFACE}.conf", pwd, user)
-
-            # IP forwarding
-            self.run_cmd(ssh, "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wireguard.conf", pwd, user)
-            self.run_cmd(ssh, "sysctl -w net.ipv4.ip_forward=1", pwd, user)
-
-            # Firewall: abrir UDP 51820
-            if is_ubuntu:
-                self.run_cmd(ssh, f"iptables -C INPUT -p udp --dport {WG_PORT} -j ACCEPT 2>/dev/null || "
-                                  f"iptables -I INPUT -p udp --dport {WG_PORT} -j ACCEPT", pwd, user)
-            else:
-                self.run_cmd(ssh, f"firewall-cmd --permanent --add-port={WG_PORT}/udp 2>/dev/null || true", pwd, user)
-                self.run_cmd(ssh, "firewall-cmd --permanent --add-masquerade 2>/dev/null || true", pwd, user)
-                self.run_cmd(ssh, "firewall-cmd --reload 2>/dev/null || true", pwd, user)
-
-            # Levantar
-            self.run_cmd(ssh, f"systemctl enable wg-quick@{WG_IFACE}", pwd, user)
-            self.run_cmd(ssh, f"systemctl restart wg-quick@{WG_IFACE}", pwd, user)
-
-            _, status, _ = self.run_cmd(ssh, f"systemctl is-active wg-quick@{WG_IFACE}", pwd, user, hide_output=True)
-            if status.strip() != 'active':
-                _, logs, _ = self.run_cmd(ssh, f"journalctl -u wg-quick@{WG_IFACE} -n 20 --no-pager", pwd, user, hide_output=True)
-                ssh.close()
-                return {'success': False, 'error': f'WireGuard no arrancó:\n{logs}'}
-
-            ssh.close()
+            res = self._write_and_apply(ssh, server_id, server_priv, pwd, user, restart=True)
+            if not res['success']:
+                return res
             self.db.set_config('wg_pubkey', server_pub)
             return {'success': True, 'message': 'WireGuard instalado', 'server_pubkey': server_pub}
         except Exception as e:
-            try:
-                ssh.close()
-            except Exception:
-                pass
             return {'success': False, 'error': str(e)}
+        finally:
+            ssh.close()
+
+    def uninstall_wireguard(self, server_id: int) -> Dict:
+        server = self.db.get_server(server_id)
+        ssh = self._connect(server) if server else None
+        if not ssh:
+            return {'success': False, 'error': 'No se pudo conectar a la VPS por SSH'}
+        try:
+            self.run_cmd(ssh, f"systemctl disable --now wg-quick@{WG_IFACE} 2>/dev/null; "
+                              f"rm -f {WG_DIR}/{WG_IFACE}.conf; true", server['password'], server['username'])
+            return {'success': True, 'message': 'WireGuard desinstalado (las llaves del servidor se conservan)'}
+        finally:
+            ssh.close()
 
     def is_wireguard_installed(self, server_id: int) -> bool:
         server = self.db.get_server(server_id)
-        if not server:
-            return False
-        ssh = self._connect(server)
+        ssh = self._connect(server) if server else None
         if not ssh:
             return False
         try:
             _, out, _ = self.run_cmd(ssh, f"systemctl is-active wg-quick@{WG_IFACE}",
-                                     server['password'], server['username'], hide_output=True)
-            ssh.close()
+                                     server['password'], server['username'])
             return out.strip() == "active"
-        except Exception:
+        finally:
             ssh.close()
-            return False
 
     # ------------------------------------------------------------------
     # Peers
@@ -208,73 +175,50 @@ PostDown = iptables -D FORWARD -i {WG_IFACE} -j ACCEPT; iptables -D FORWARD -o {
                 return ip
         return None
 
-    def prepare_peer(self, server_id: int, username: str) -> Dict[str, any]:
-        """Genera llaves del cliente y asigna IP. No toca el servidor todavía."""
+    def prepare_peer(self, server_id: int, username: str) -> Dict:
         server = self.db.get_server(server_id)
         if not server:
             return {'success': False, 'error': 'Servidor no encontrado'}
-
         ip = self.next_free_ip(server_id)
         if not ip:
-            return {'success': False, 'error': 'No hay IPs libres en la subred'}
-
-        priv, pub = self.generate_keys()
+            return {'success': False, 'error': 'No hay IPs libres (máximo 253 clientes WireGuard)'}
         server_pub = self.db.get_config('wg_pubkey') or ''
+        if not server_pub:
+            return {'success': False, 'error': 'WireGuard no está instalado (falta la llave del servidor)'}
+        priv, pub = self.generate_keys()
         return {
-            'success': True,
-            'client_priv': priv,
-            'client_pub': pub,
-            'ip': ip,
+            'success': True, 'client_priv': priv, 'client_pub': pub, 'ip': ip,
             'server_pub': server_pub,
-            'endpoint': f"{server['ip']}:{WG_PORT}",
+            'endpoint': f"{self.endpoint_host(server)}:{WG_PORT}",
             'server_ip': server['ip'],
         }
 
-    def rebuild(self, server_id: int) -> Dict[str, any]:
-        """Reescribe wg0.conf desde la DB y sincroniza sin cortar los demás peers."""
+    def rebuild(self, server_id: int, restart: bool = False) -> Dict:
+        """Reescribe wg0.conf desde la DB y lo aplica. Sincroniza también la llave pública."""
         server = self.db.get_server(server_id)
         if not server:
             return {'success': False, 'error': 'Servidor no encontrado'}
         ssh = self._connect(server)
         if not ssh:
-            return {'success': False, 'error': 'No se pudo conectar al servidor'}
+            return {'success': False, 'error': 'No se pudo conectar a la VPS por SSH'}
         pwd, user = server['password'], server['username']
         try:
-            _, server_priv, _ = self.run_cmd(ssh, f"cat {WG_DIR}/server_private.key", pwd, user, hide_output=True)
+            _, server_priv, _ = self.run_cmd(ssh, f"cat {WG_DIR}/server_private.key 2>/dev/null", pwd, user)
             server_priv = server_priv.strip()
             if not server_priv:
-                ssh.close()
                 return {'success': False, 'error': 'WireGuard no está instalado'}
-
-            _, iface, _ = self.run_cmd(ssh, "ip route | awk '/default/ {print $5}' | head -n1", pwd, user, hide_output=True)
-            iface = iface.strip() or "eth0"
-
-            peers = self.db.get_wg_users(server_id)
-            conf = self._render_conf(server_priv, iface, peers)
-            self.run_cmd(ssh, f"cat > {WG_DIR}/{WG_IFACE}.conf << 'EOF'\n{conf}EOF", pwd, user)
-            self.run_cmd(ssh, f"chmod 600 {WG_DIR}/{WG_IFACE}.conf", pwd, user)
-
-            # Aplicar cambios de peers sin tirar las conexiones existentes
-            self.run_cmd(ssh, f"bash -c 'wg syncconf {WG_IFACE} <(wg-quick strip {WG_IFACE})'", pwd, user)
-
-            ssh.close()
-            return {'success': True}
+            _, server_pub, _ = self.run_cmd(ssh, f"cat {WG_DIR}/server_private.key | wg pubkey", pwd, user)
+            if server_pub.strip():
+                self.db.set_config('wg_pubkey', server_pub.strip())
+            self.run_cmd(ssh, "sysctl -w net.ipv4.ip_forward=1 >/dev/null", pwd, user)
+            open_udp_port(ssh, WG_PORT, pwd, user)
+            return self._write_and_apply(ssh, server_id, server_priv, pwd, user, restart=restart)
         except Exception as e:
-            try:
-                ssh.close()
-            except Exception:
-                pass
             return {'success': False, 'error': str(e)}
+        finally:
+            ssh.close()
 
     def client_conf(self, client_priv: str, ip: str, server_pub: str, endpoint: str) -> str:
-        return f"""[Interface]
-PrivateKey = {client_priv}
-Address = {ip}/32
-DNS = {CLIENT_DNS}
-
-[Peer]
-PublicKey = {server_pub}
-Endpoint = {endpoint}
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-"""
+        return (f"[Interface]\nPrivateKey = {client_priv}\nAddress = {ip}/32\nDNS = {CLIENT_DNS}\n"
+                f"MTU = {CLIENT_MTU}\n\n[Peer]\nPublicKey = {server_pub}\nEndpoint = {endpoint}\n"
+                f"AllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n")

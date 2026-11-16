@@ -1,61 +1,60 @@
-from datetime import datetime
 from telegram import Update
 from telegram.ext import ContextTypes
-from lib.helpers import is_admin, escape_html
-from lib.runtime import uptime_str
-from src.menus import get_main_menu
-from database import Database
+
 import config
+from database import Database
+from lib.helpers import is_admin
+from lib.ui import BRAND, LINE, esc, tip, bar, days_left, safe_edit
+from src.menus import get_main_menu
 
 db = Database(config.DB_PATH)
 
 
+def plan_line(user_id: int) -> str:
+    if is_admin(user_id):
+        return "👑 Plan: <b>Administrador</b> · sin límites"
+    used = db.count_user_accounts(user_id)
+    if db.is_reseller_active(user_id):
+        r = db.get_reseller(user_id)
+        d = max(days_left(r['expires_at']), 0)
+        return (f"⭐ Plan: <b>Premium</b> · vence en {d} días\n"
+                f"📦 Cuentas: {bar(used, r['max_accounts'], 8)} {used}/{r['max_accounts']}")
+    return f"🆓 Plan: <b>Gratis</b> · 📦 Cuentas: {used}/1"
+
+
+def home_text(user) -> str:
+    server = db.get_all_servers()
+    ready = bool(server) and (bool(server[0].get('pubkey')) or bool(db.get_config('wg_pubkey')))
+    status = "🟢 Servicio en línea" if ready else "🟡 Servicio en configuración"
+    return (
+        f"🚀 <b>{esc(BRAND.upper())}</b>\n"
+        f"<i>Internet libre, rápido y seguro</i>\n"
+        f"{LINE}\n"
+        f"👋 Hola, <b>{esc(user.first_name or 'amigo')}</b>\n\n"
+        f"{status}\n"
+        f"{plan_line(user.id)}\n"
+        f"{tip('Elegí un protocolo abajo y creá tu cuenta en segundos.')}"
+    )
+
+
+async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+    user = update.effective_user
+    kb = get_main_menu(is_admin(user.id))
+    if edit and update.callback_query:
+        await safe_edit(update.callback_query, home_text(user), kb)
+    else:
+        await update.effective_message.reply_text(home_text(user), parse_mode='HTML', reply_markup=kb,
+                                                  disable_web_page_preview=True)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    is_admin_user = is_admin(user.id)
+    if not db.is_public_mode() and not is_admin(user.id) and not db.is_premium(user.id):
+        await update.message.reply_text(config.PRIVATE_MESSAGE, parse_mode='HTML')
+        return
+    await send_home(update, context)
 
-    # --- MODO PRIVADO: bloqueo directo, sin botones ---
-    if not db.is_public_mode():
-        is_premium = db.is_premium(user.id)
-        if not is_admin_user and not is_premium:
-            await update.message.reply_text(
-                config.PRIVATE_MESSAGE,
-                parse_mode='HTML'
-            )
-            return
 
-    # --- MODO PÚBLICO o Admin/Premium ---
-    servers = db.get_all_servers()
-    total_servers = len(servers)
-    users = db.get_active_users_count()
-    status = "✅ Servidor Activo" if total_servers > 0 else "⚠️ Sin servidor configurado"
-
-    # Detalle del usuario
-    my_accounts = db.count_user_accounts(user.id)
-    user_line = f"👤 Tus cuentas: <b>{my_accounts}</b>"
-    if db.is_reseller_active(user.id):
-        r = db.get_reseller(user.id)
-        try:
-            plan_days = (datetime.fromisoformat(r['expires_at']) - datetime.now()).days
-        except (ValueError, TypeError):
-            plan_days = 0
-        user_line += (f"\n⭐ Plan: {my_accounts}/{r['max_accounts']} cuentas · "
-                      f"vence en {plan_days}d")
-
-    welcome = f"""
-✨ <b>¡Bienvenido al NETWORK VPN!</b> 🚀
-
-Hello {escape_html(user.first_name)} 👋
-
-━━━━━━━━━━━━━━━━━━━
-📊 <b>Estado del Sistema</b>
-━━━━━━━━━━━━━━━━━━━
-📶 Estado: {status}
-👥 Cuentas totales: {users}
-{user_line}
-⏱️ Uptime: <b>{uptime_str()}</b>
-━━━━━━━━━━━━━━━━━━━
-
-Selecciona una opción
-"""
-    await update.message.reply_text(welcome, parse_mode='HTML', reply_markup=get_main_menu(is_admin_user))
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✖️ Operación cancelada.")
+    await send_home(update, context)

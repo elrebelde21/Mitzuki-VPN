@@ -56,7 +56,13 @@ if not DEFAULT_SERVER['tunnel_domain']:
 # Configuración de VayDNS
 VAYDNS_BINARY_URL = 'https://raw.githubusercontent.com/phoenixdnsvpn/phoenix-vpn/main/scripts/vaydns-server'
 APP_DOWNLOAD_URL = _env_str('APP_DOWNLOAD_URL', 'https://tu-link-de-descarga.com')
-WG_APP_DOWNLOAD_URL = 'https://play.google.com/store/apps/details?id=com.wireguard.android'
+WG_APP_DOWNLOAD_URL = _env_str('WG_APP_DOWNLOAD_URL', 'https://play.google.com/store/apps/details?id=com.wireguard.android')
+
+# Host que usan los clientes WireGuard (vacío = IP de la VPS). Útil si usás un dominio.
+WG_ENDPOINT = _env_str('WG_ENDPOINT', '')
+
+# Nombre que se muestra en el bot
+BOT_NAME = _env_str('BOT_NAME', 'Mitzuki VPN')
 
 # ============================================
 # MODO PÚBLICO / PRIVADO
@@ -69,14 +75,13 @@ PUBLIC_MODE = _env_bool('PUBLIC_MODE', False)
 OWNER_CONTACT = _env_str('OWNER_CONTACT', '@itschinitaofc')
 
 # Mensaje para usuarios sin acceso
-PRIVATE_MESSAGE = f"""
-🔒 <b>SISTEMA PRIVADO</b>
+PRIVATE_MESSAGE = f"""🔒 <b>{BOT_NAME} · Acceso privado</b>
+━━━━━━━━━━━━━━━━━━━━
 
-Este bot está en modo privado.
+Este bot funciona solo con invitación.
 
-Para obtener acceso, contacta al owner:
+Para obtener acceso, escribile al owner y pasale tu ID
+(lo ves con /id):
 
 👤 <b>Owner:</b> {OWNER_CONTACT}
-
-¡Gracias por tu interés! 🙏
 """

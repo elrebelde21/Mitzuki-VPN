@@ -20,6 +20,8 @@ from telegram.ext import (
 import config
 from database import Database
 from lib.helpers import is_admin, escape_html
+from lib.ui import header, kv, code, b, fmt_date, steps, tip
+from src.flow import fallbacks, FLOW_TIMEOUT
 
 db = Database(config.DB_PATH)
 
@@ -41,7 +43,7 @@ def _kb(prefix, opts):
     # agrupa en filas de 3 + botón cancelar
     rows = [opts[i:i + 3] for i in range(0, len(opts), 3)]
     kb = [[InlineKeyboardButton(str(o), callback_data=f'{prefix}_{o}') for o in r] for r in rows]
-    kb.append([InlineKeyboardButton("❌ Cancelar", callback_data='pcancel')])
+    kb.append([InlineKeyboardButton("✖️ Cancelar", callback_data='pcancel')])
     return InlineKeyboardMarkup(kb)
 
 
@@ -57,9 +59,9 @@ async def premium_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['p'] = {}
     await query.edit_message_text(
-        "⭐ <b>Dar Premium</b>\n\n"
-        "🆔 Escribí el <b>telegram_id</b> del usuario:\n"
-        "<i>(el usuario lo obtiene con /id)</i>",
+        f"{header('⭐', 'Dar Premium', steps(1, 5))}\n"
+        "🆔 Escribí el <b>ID de Telegram</b> del usuario:\n"
+        + tip("El usuario lo ve mandándole <code>/id</code> al bot."),
         parse_mode='HTML'
     )
     return P_TGID
@@ -77,6 +79,7 @@ async def premium_tgid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['p']['tgid'] = tgid
     await update.message.reply_text(
+        f"{header('⭐', 'Dar Premium', steps(2, 5))}\n"
         f"🆔 Usuario: <code>{tgid}</code>\n\n"
         "📦 ¿Cuántas <b>cuentas</b> puede crear?",
         parse_mode='HTML',
@@ -90,8 +93,9 @@ async def premium_acc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data['p']['acc'] = int(query.data.split('_')[1])
     await query.edit_message_text(
+        f"{header('⭐', 'Dar Premium', steps(3, 5))}\n"
         f"📦 Cuentas: <b>{context.user_data['p']['acc']}</b>\n\n"
-        "📱 ¿Cuántas <b>conexiones máx</b> por cuenta?",
+        "📱 ¿Cuántas <b>conexiones</b> por cuenta?",
         parse_mode='HTML',
         reply_markup=_kb('pcon', CONN_OPTS)
     )
@@ -103,8 +107,9 @@ async def premium_conn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data['p']['conn'] = int(query.data.split('_')[1])
     await query.edit_message_text(
+        f"{header('⭐', 'Dar Premium', steps(4, 5))}\n"
         f"📱 Conexiones: <b>{context.user_data['p']['conn']}</b>\n\n"
-        "📅 ¿Cuántos <b>días máx</b> por cuenta?",
+        "📅 ¿Cuántos <b>días máximo</b> por cuenta?",
         parse_mode='HTML',
         reply_markup=_kb('pday', DAYS_OPTS)
     )
@@ -116,6 +121,7 @@ async def premium_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data['p']['days'] = int(query.data.split('_')[1])
     await query.edit_message_text(
+        f"{header('⭐', 'Dar Premium', steps(5, 5))}\n"
         f"📅 Días por cuenta: <b>{context.user_data['p']['days']}</b>\n\n"
         "⏳ ¿Cuánto <b>dura el plan</b> (días)?",
         parse_mode='HTML',
@@ -137,14 +143,31 @@ async def premium_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = db.get_reseller(p['tgid'])
 
     await query.edit_message_text(
-        f"✅ <b>Plan Premium Otorgado</b>\n\n"
-        f"🆔 Usuario: <code>{p['tgid']}</code>\n"
-        f"📦 Cuentas máx: <b>{p['acc']}</b>\n"
-        f"📱 Conexiones máx: <b>{p['conn']}</b>\n"
-        f"📅 Días máx por cuenta: <b>{p['days']}</b>\n"
-        f"⏳ Plan vence: <b>{r['expires_at'][:10]}</b>",
-        parse_mode='HTML'
+        "\n".join([
+            header('✅', 'Premium otorgado'),
+            kv("🆔", "Usuario", code(p['tgid'])),
+            kv("📦", "Cuentas máx.", b(p['acc'])),
+            kv("📱", "Conexiones por cuenta", b(p['conn'])),
+            kv("📅", "Días máx. por cuenta", b(p['days'])),
+            kv("⏳", "El plan vence", b(fmt_date(r['expires_at']))),
+            tip("Avisale que ya puede entrar con /start."),
+        ]),
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⭐ Premium", callback_data='admin_premium_menu'),
+            InlineKeyboardButton("◀️ Panel", callback_data='admin_panel')]])
     )
+    try:
+        await context.bot.send_message(
+            p['tgid'],
+            "\n".join([header('⭐', '¡Ya sos Premium!'),
+                        kv("📦", "Cuentas", b(p['acc'])),
+                        kv("📱", "Conexiones por cuenta", b(p['conn'])),
+                        kv("⏳", "Tu plan vence", b(fmt_date(r['expires_at']))),
+                        tip("Mandá /start para crear tus cuentas.")]),
+            parse_mode='HTML')
+    except Exception:
+        pass
     context.user_data.pop('p', None)
     return ConversationHandler.END
 
@@ -153,7 +176,9 @@ async def premium_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.pop('p', None)
-    await query.edit_message_text("❌ Cancelado.")
+    await query.edit_message_text(
+        "✖️ Cancelado.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Panel", callback_data='admin_panel')]]))
     return ConversationHandler.END
 
 
@@ -166,10 +191,10 @@ premium_conv = ConversationHandler(
         P_DAYS: [CallbackQueryHandler(premium_days, pattern='^pday_')],
         P_PLAN: [CallbackQueryHandler(premium_plan, pattern='^ppln_')],
     },
-    fallbacks=[
-        CallbackQueryHandler(premium_cancel, pattern='^pcancel$'),
-        CommandHandler('cancel', premium_cancel),
-    ],
+    fallbacks=[CallbackQueryHandler(premium_cancel, pattern='^pcancel$')]
+              + fallbacks(('pacc_', 'pcon_', 'pday_', 'ppln_', 'pcancel', 'admin_premium$')),
+    allow_reentry=True,
+    conversation_timeout=FLOW_TIMEOUT,
 )
 
 
@@ -254,7 +279,7 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await update.message.reply_text(
-        f"🆔 <b>Tu ID de Telegram:</b> <code>{u.id}</code>\n\n"
-        "Pasáselo al owner para que te dé acceso.",
+        f"{header('🆔', 'Tu ID de Telegram')}\n<code>{u.id}</code>\n\n"
+        f"Tocalo para copiarlo y pasáselo a {escape_html(config.OWNER_CONTACT)} para obtener acceso.",
         parse_mode='HTML'
     )

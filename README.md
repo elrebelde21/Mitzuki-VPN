@@ -9,21 +9,18 @@ Bot de Telegram para administrar un servidor VPN por DNS (**VayDNS**) y vender o
 ## ✨ Funciones
 
 **Para los usuarios**
-- 👤 Ver su cuenta (usuario, contraseña, vencimiento, link de la app).
-- ➕ Crear cuenta SSH/SOCKS (túnel DNS con VayDNS).
-- 🛡️ Crear cuenta WireGuard.
-- Los links salen listos para importar en la app (`dnst://...`).
+- 🚀 **Crear VayDNS** (túnel DNS, ideal para redes restringidas) y 🛡️ **Crear WireGuard** (VPN directa, la más rápida), paso a paso y con botones.
+- 👤 **Mis cuentas**: datos, link de importación (siempre actualizado), `.conf` + QR de WireGuard, eliminar.
+- ⭐ **Mi plan**: límites y vencimiento. 📖 **Cómo conectar**: guías y "No me conecta".
+- 🔔 Aviso automático cuando la cuenta está por vencer y cuando vence.
 
-**Para el admin (⚙️ Panel Admin)**
-- 🚀 Instalar **VayDNS**, 🦅 **Soar**, 🛡️ **WireGuard**, 🌀 **Slipstream**, 🌐 **MasterDnsVPN** en la VPS con un botón.
-- 🗑️ Desinstalar cualquiera de ellos.
-- 🌐 Verificar que los DNS (A y NS) estén bien configurados.
-- 📊 Dashboard, 📡 tráfico de la VPS, 📋 logs, 👥 lista de cuentas.
-- 🔀 **Record Type**: cambiar el tipo de registro DNS del servidor (ver abajo).
-- 🔐 **Backend**: SSH (límite real de conexiones) o SOCKS (más estable en redes difíciles).
-- ⭐ Dar **Premium** / revendedores con límites de cuentas, conexiones y días.
-- 🔄 Actualizar los links de todas las cuentas tras un cambio.
-- ⚙️ Modo **Público** (cualquiera crea cuenta) o **Privado** (solo admin y premium).
+**Para el admin (🛠️ Panel de administración)**
+- 🩺 **Diagnóstico** de punta a punta (VPS, servicios, puerto 53, backend, DNS, firewall, WireGuard) y 🔧 **Reparar todo** con un toque.
+- 🧩 **Servicios**: estado e instalación/desinstalación de VayDNS, WireGuard, Soar, Slipstream y MasterDnsVPN.
+- 👥 **Cuentas**: lista paginada, detalle con conexiones en vivo, ➕ renovar 7/30 días, reenviar datos, eliminar.
+- 🔀 **Record type** (los 9 tipos) y 🔐 **Backend** SSH/SOCKS: se aplican en la VPS y regeneran todos los links.
+- ⭐ **Premium**: dar planes paso a paso, ver activos y quitarlos.
+- 📊 Dashboard, 🌐 DNS, 📡 tráfico, 📋 actividad y ⚙️ modo Público/Privado.
 - 🧹 Las cuentas vencidas se borran solas cada 5 minutos.
 
 ---
@@ -42,7 +39,9 @@ Bot de Telegram para administrar un servidor VPN por DNS (**VayDNS**) y vender o
 | **A** | `ns.tudominio.com` | IP de tu VPS | En Cloudflare: nube **gris** (sin proxy) |
 | **NS** | `d.tudominio.com` | `ns.tudominio.com` | Este es el dominio del túnel |
 
-Después puedes comprobarlo desde el bot con **🌐 Verificar DNS**.
+Después puedes comprobarlo desde el bot con **🛠️ Panel → 🌐 DNS**.
+
+> ☁️ Si tu proveedor tiene firewall propio (Oracle Cloud, AWS, Google Cloud, Azure...), abre ahí **UDP 53** (VayDNS) y **UDP 51820** (WireGuard). El bot abre el firewall de la VPS, pero no el del proveedor.
 
 ---
 
@@ -73,7 +72,10 @@ Edita el archivo `.env` con tus datos:
 | `DEFAULT_SERVER_PORT` | Puerto DNS (por defecto `53`) |
 | `PUBLIC_MODE` | `true` = público, `false` = privado (se puede cambiar desde el bot) |
 | `OWNER_CONTACT` | Tu @usuario, se muestra a quien no tiene acceso |
-| `APP_DOWNLOAD_URL` | Link de descarga de la app cliente |
+| `BOT_NAME` | Nombre que se muestra en el bot |
+| `APP_DOWNLOAD_URL` | Link de descarga de la app cliente de VayDNS |
+| `WG_APP_DOWNLOAD_URL` | Link de descarga de la app WireGuard |
+| `WG_ENDPOINT` | Host para WireGuard (vacío = IP de la VPS) |
 
 > 🔒 Nunca subas tu `.env` a GitHub (ya está en `.gitignore`).
 
@@ -93,16 +95,19 @@ python3 bot.py
 ## 🧭 Primeros pasos
 
 1. Abre el bot y manda `/start`.
-2. Entra a **⚙️ Panel Admin → 🚀 VayDNS** e instala el servidor.
-3. Revisa **🌐 Verificar DNS**.
-4. Crea una cuenta con **➕ Crear SSH** y pruébala en la app.
-5. Elige **⚙️ Configuración** → Público o Privado.
+2. **🛠️ Panel → 🧩 Servicios → 📥 Instalar** VayDNS (y WireGuard si lo quieres).
+3. **🛠️ Panel → 🩺 Diagnóstico**: todo debe quedar en 🟢. Si algo sale en 🔴, toca **🔧 Reparar todo** y sigue la indicación de esa línea.
+4. Crea una cuenta con **🚀 Crear VayDNS** o **🛡️ Crear WireGuard** y pruébala.
+5. Elige **⚙️ Modo** → Público o Privado.
+
+### ¿Actualizaste el bot y tenías VayDNS instalado?
+Toca una vez **🛠️ Panel → 🩺 Diagnóstico → 🔧 Reparar todo**. Esto reescribe el servicio en la VPS con la configuración nueva y regenera los links. Después, los clientes deben copiar de nuevo su link desde **👤 Mis cuentas**.
 
 ---
 
 ## 🔀 Record Type
 
-Es el tipo de registro DNS por donde viaja el túnel. Si en tu red un tipo está bloqueado o va lento, cámbialo a otro desde **⚙️ Panel Admin → 🔀 Record**.
+Es el tipo de registro DNS por donde viaja el túnel. Si en tu red un tipo está bloqueado o va lento, cámbialo a otro desde **🛠️ Panel → 🔀 Record**.
 
 | Tipo | Uso |
 |------|-----|
@@ -119,7 +124,7 @@ Es el tipo de registro DNS por donde viaja el túnel. Si en tu red un tipo está
 Al cambiarlo:
 - El bot reinicia VayDNS en la VPS con el nuevo tipo.
 - Las **cuentas nuevas** salen con ese tipo.
-- Los **clientes que ya tienen cuenta** deben poner el mismo Record Type en la app (o usa **🔄 Actualizar Links**).
+- Los links de **todas** las cuentas se regeneran solos: los clientes solo tienen que copiar de nuevo el suyo desde **👤 Mis cuentas**.
 
 ---
 
@@ -128,6 +133,7 @@ Al cambiarlo:
 | Comando | Quién | Qué hace |
 |---------|-------|----------|
 | `/start` | Todos | Menú principal |
+| `/cancel` | Todos | Cancela lo que estés haciendo |
 | `/id` | Todos | Muestra tu ID de Telegram |
 | `/plan` | Todos | Muestra tu plan premium |
 | `/system` | Admin | Estado de la VPS |
@@ -139,7 +145,11 @@ Al cambiarlo:
 
 ## ❓ Problemas comunes
 
+Lo primero siempre: **🛠️ Panel → 🩺 Diagnóstico**. Te dice qué falla y cómo arreglarlo.
+
 - **`NameError: name 'process' is not defined`** → `config.py` viejo; usa el del repo y pon tus datos en `.env`.
 - **El bot no responde a los botones de admin** → tu ID no está en `ADMIN_IDS`.
-- **VayDNS no instala: puerto 53 ocupado** → en la VPS: `systemctl disable --now systemd-resolved` (o desinstala Soar desde el bot).
-- **La cuenta no conecta** → revisa los registros DNS, que el Record Type de la app sea el mismo que el del servidor, y prueba otro tipo.
+- **"Prueba de punta a punta" en 🔴** → las consultas DNS no llegan a la VPS: revisa el registro **NS** y que el firewall del **proveedor** deje pasar **UDP 53**.
+- **VayDNS conecta y se corta / no conecta** → toca **🔧 Reparar todo** y que el cliente copie de nuevo su link. Si la red bloquea el tipo actual, prueba otro **Record type**.
+- **WireGuard importa pero no navega** → **🔧 Reparar todo**; abre **UDP 51820** en el firewall del proveedor. Un mismo `.conf` en dos dispositivos a la vez se desconectan entre sí.
+- **Puerto 53 ocupado** → quita Soar / Slipstream / MasterDnsVPN desde **🧩 Servicios** (el bot ya libera `systemd-resolved` solo).

@@ -136,6 +136,26 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
+    def ensure_default_server(self) -> Optional[Dict[str, Any]]:
+        """Devuelve el servidor principal; lo crea o sincroniza con el .env (IP, SSH, dominio)."""
+        d = config.DEFAULT_SERVER
+        servers = self.get_all_servers()
+        if not d.get('ip') or not d.get('password'):
+            return servers[0] if servers else None
+        if not servers:
+            sid = self.add_server(d['name'], d['ip'], d['ssh_port'], d['username'], d['password'], d['domain'])
+            return self.get_server(sid)
+        s = servers[0]
+        new = (d['ip'], d['ssh_port'], d['username'], d['password'], d['domain'])
+        if (s['ip'], s['ssh_port'], s['username'], s['password'], s['domain']) != new:
+            conn = self.get_connection()
+            conn.execute('UPDATE servers SET ip=?, ssh_port=?, username=?, password=?, domain=?, '
+                         'updated_at=CURRENT_TIMESTAMP WHERE id=?', (*new, s['id']))
+            conn.commit()
+            conn.close()
+            s = self.get_server(s['id'])
+        return s
+
     def update_server_pubkey(self, server_id: int, pubkey: str):
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -290,6 +310,73 @@ class Database:
         conn.close()
         return new_expiry
 
+    def add_days_to_user(self, user_id: int, days: int) -> Optional[str]:
+        """Suma días desde el vencimiento actual (o desde hoy si ya venció)."""
+        u = self.get_user_by_id(user_id)
+        if not u:
+            return None
+        try:
+            base = max(datetime.fromisoformat(u['expires_at']), datetime.now())
+        except (ValueError, TypeError):
+            base = datetime.now()
+        new_expiry = (base + timedelta(days=days)).isoformat()
+        conn = self.get_connection()
+        conn.execute('UPDATE users SET expires_at = ? WHERE id = ?', (new_expiry, user_id))
+        conn.commit()
+        conn.close()
+        return new_expiry
+
+    def update_user_url(self, user_id: int, url: str):
+        conn = self.get_connection()
+        conn.execute('UPDATE users SET vaydns_url = ? WHERE id = ?', (url, user_id))
+        conn.commit()
+        conn.close()
+
+    def get_vaydns_users(self) -> List[Dict[str, Any]]:
+        """Cuentas VayDNS (SSH/SOCKS) activas."""
+        conn = self.get_connection()
+        rows = conn.execute("""
+            SELECT * FROM users
+            WHERE is_active = 1 AND COALESCE(conn_type, 'vaydns') != 'wireguard'
+        """).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def count_by_type(self) -> Dict[str, int]:
+        conn = self.get_connection()
+        rows = conn.execute("""
+            SELECT COALESCE(conn_type, 'vaydns') AS t, COUNT(*) AS n
+            FROM users WHERE is_active = 1 GROUP BY t
+        """).fetchall()
+        conn.close()
+        res = {'vaydns': 0, 'wireguard': 0}
+        for r in rows:
+            res['wireguard' if r['t'] == 'wireguard' else 'vaydns'] += r['n']
+        return res
+
+    def count_expiring(self, days: int = 3) -> int:
+        conn = self.get_connection()
+        limit = (datetime.now() + timedelta(days=days)).isoformat()
+        n = conn.execute('SELECT COUNT(*) FROM users WHERE is_active = 1 AND expires_at < ?',
+                         (limit,)).fetchone()[0]
+        conn.close()
+        return n
+
+    def count_resellers(self) -> int:
+        conn = self.get_connection()
+        now = datetime.now().isoformat()
+        n = conn.execute('SELECT COUNT(*) FROM resellers WHERE expires_at > ?', (now,)).fetchone()[0]
+        conn.close()
+        return n
+
+    def get_active_resellers(self) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        now = datetime.now().isoformat()
+        rows = conn.execute('SELECT * FROM resellers WHERE expires_at > ? ORDER BY expires_at',
+                            (now,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
     def deactivate_user(self, telegram_id: int):
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -340,7 +427,7 @@ class Database:
     def get_logs(self, limit: int = 20) -> List[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT * FROM logs ORDER BY created_at DESC LIMIT ?', (limit,))
+        cursor.execute('SELECT * FROM logs ORDER BY id DESC LIMIT ?', (limit,))
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
